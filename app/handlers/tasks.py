@@ -83,11 +83,14 @@ async def task_action_callback(call: CallbackQuery):
                                     details={"task_id": task_id})
             if task:
                 await call.message.edit_text(f"✅ Отметил выполненной:\n\n<b>{task.title}</b>")
+
         elif action == "delete":
             task = await task_repo.soft_delete_task(session, task_id)
             await repos.log_action(session, user.id, "delete_task",
                                     details={"task_id": task_id})
             if task:
                 await call.message.edit_text(f"🗑 Удалил:\n\n<b>{task.title}</b>")
+            else:
+                await call.message.edit_text("🗑 Задача удалена.")
 
     await call.answer()

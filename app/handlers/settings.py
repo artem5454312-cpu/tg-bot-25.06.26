@@ -3,30 +3,27 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from sqlalchemy import select, delete
 
 from app.db.engine import AsyncSessionLocal
 from app.db import repos
-from app.db.models import AdminSession, UserRole
+from app.db.models import AdminSession, UserRole, Memory, User
 from app.keyboards import settings_menu, users_menu, roles_keyboard, pin_keyboard
 from config.settings import settings
-from sqlalchemy import select
 
 router = Router()
-
-PIN_SESSION_HOURS = 4  # PIN valid for N hours
+PIN_SESSION_HOURS = 4
 
 
 class PinState(StatesGroup):
     entering_pin = State()
-    entered = State()
 
 
 class InviteState(StatesGroup):
     choosing_role = State()
-    done = State()
 
 
-# ─── Settings button ─────────────────────────────────────────────────────────
+# ─── Settings button ──────────────────────────────────────────────────────────
 
 @router.message(F.text == "⚙️ Настройки")
 async def settings_button(message: Message, state: FSMContext):
@@ -35,7 +32,6 @@ async def settings_button(message: Message, state: FSMContext):
         await message.answer("⛔ Настройки доступны только владельцу.")
         return
 
-    # Check PIN session
     if await _pin_is_valid(tg.id):
         await message.answer("⚙️ Настройки:", reply_markup=settings_menu())
     else:
@@ -45,7 +41,7 @@ async def settings_button(message: Message, state: FSMContext):
                               reply_markup=pin_keyboard())
 
 
-# ─── PIN keyboard callbacks ───────────────────────────────────────────────────
+# ─── PIN keyboard ─────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("pin:"), PinState.entering_pin)
 async def pin_input(call: CallbackQuery, state: FSMContext):
@@ -96,7 +92,7 @@ async def settings_callback(call: CallbackQuery, state: FSMContext):
         lines = ["<b>👥 Пользователи</b>\n"]
         for u in users:
             name = u.first_name or u.username or str(u.telegram_id)
-            lines.append(f"• {name} — {u.role.value} ({u.status.value})")
+            lines.append(f"- {name} — {u.role.value} ({u.status.value})")
         await call.message.edit_text("\n".join(lines), reply_markup=users_menu())
 
     elif action == "invite":
@@ -117,10 +113,19 @@ async def settings_callback(call: CallbackQuery, state: FSMContext):
             await call.message.edit_text("\n".join(lines), reply_markup=settings_menu())
 
     elif action == "memory":
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Очистить личную память", callback_data="memory:clear:personal")],
+            [InlineKeyboardButton(text="🗑 Очистить глобальную память", callback_data="memory:clear:global")],
+            [InlineKeyboardButton(text="🗑 Очистить ВСЮ память", callback_data="memory:clear:all")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="settings:back")],
+        ])
         await call.message.edit_text(
-            "🧠 Управление памятью:\n\nНапиши: <i>Что ты помнишь?</i>\n"
-            "Или: <i>Запомни, что...</i>",
-            reply_markup=settings_menu()
+            "🧠 Управление памятью:\n\n"
+            "Выбери что очистить или напиши боту:\n"
+            "<i>Запомни, что...</i>\n"
+            "<i>Что ты помнишь?</i>",
+            reply_markup=kb
         )
 
     elif action == "models":
@@ -134,6 +139,55 @@ async def settings_callback(call: CallbackQuery, state: FSMContext):
 
     elif action == "back":
         await call.message.edit_text("⚙️ Настройки:", reply_markup=settings_menu())
+
+    await call.answer()
+
+
+# ─── Memory clear callbacks ───────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("memory:clear:"))
+async def memory_clear_callback(call: CallbackQuery):
+    if call.from_user.id != settings.OWNER_TELEGRAM_ID:
+        await call.answer("⛔ Нет доступа.", show_alert=True)
+        return
+
+    scope = call.data.split(":")[2]
+    tg = call.from_user
+
+    async with AsyncSessionLocal() as session:
+        user = await repos.get_user_by_telegram_id(session, tg.id)
+        if not user:
+            await call.answer("Пользователь не найден.")
+            return
+
+        from app.db.models import MemoryType
+
+        if scope == "personal":
+            await session.execute(
+                delete(Memory).where(
+                    Memory.user_id == user.id,
+                    Memory.type == MemoryType.personal
+                )
+            )
+            await session.commit()
+            await call.message.edit_text("🗑 Личная память очищена.")
+
+        elif scope == "global":
+            await session.execute(
+                delete(Memory).where(
+                    Memory.user_id == user.id,
+                    Memory.type == MemoryType.global_memory
+                )
+            )
+            await session.commit()
+            await call.message.edit_text("🗑 Глобальная память очищена.")
+
+        elif scope == "all":
+            await session.execute(
+                delete(Memory).where(Memory.user_id == user.id)
+            )
+            await session.commit()
+            await call.message.edit_text("🗑 Вся память очищена.")
 
     await call.answer()
 
@@ -172,26 +226,19 @@ async def invite_role_selected(call: CallbackQuery, state: FSMContext):
 
 async def _pin_is_valid(telegram_id: int) -> bool:
     async with AsyncSessionLocal() as session:
+        user = await repos.get_user_by_telegram_id(session, telegram_id)
+        if not user:
+            return False
         result = await session.execute(
-            select(AdminSession).join(
-                repos.User if hasattr(repos, "User") else __import__(
-                    "app.db.models", fromlist=["User"]
-                ).User,
-                AdminSession.user_id == __import__(
-                    "app.db.models", fromlist=["User"]
-                ).User.id
-            ).where(
-                __import__("app.db.models", fromlist=["User"]).User.telegram_id == telegram_id
-            )
+            select(AdminSession).where(AdminSession.user_id == user.id)
         )
-        session_row = result.scalar_one_or_none()
-        if session_row and session_row.pin_verified_until:
-            return session_row.pin_verified_until > datetime.utcnow()
+        admin_session = result.scalar_one_or_none()
+        if admin_session and admin_session.pin_verified_until:
+            return admin_session.pin_verified_until > datetime.utcnow()
     return False
 
 
 async def _save_pin_session(telegram_id: int):
-    from app.db.models import User, AdminSession
     async with AsyncSessionLocal() as session:
         user = await repos.get_user_by_telegram_id(session, telegram_id)
         if not user:
@@ -205,8 +252,5 @@ async def _save_pin_session(telegram_id: int):
             admin_session.pin_verified_until = expires
             admin_session.failed_attempts = 0
         else:
-            session.add(AdminSession(
-                user_id=user.id,
-                pin_verified_until=expires,
-            ))
+            session.add(AdminSession(user_id=user.id, pin_verified_until=expires))
         await session.commit()
