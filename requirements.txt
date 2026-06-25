@@ -1,0 +1,10 @@
+aiogram==3.7.0
+openai==1.35.0
+sqlalchemy==2.0.31
+asyncpg==0.29.0
+alembic==1.13.2
+apscheduler==3.10.4
+pydantic-settings==2.3.4
+reportlab==4.2.2
+httpx==0.27.0
+python-dotenv==1.0.1
