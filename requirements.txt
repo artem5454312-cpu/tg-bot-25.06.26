@@ -1,4 +1,5 @@
 aiogram==3.7.0
+anthropic==0.28.0
 openai==1.35.0
 sqlalchemy==2.0.31
 asyncpg==0.29.0
