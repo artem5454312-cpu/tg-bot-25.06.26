@@ -206,13 +206,24 @@ async def analyze_training_progress(trainings: list, user_name: str) -> str:
 
 
 async def generate_advice(question: str, memories: str = "") -> str:
-    system = """Ты умный личный ассистент. Отвечай чётко и практично на русском языке.
-ВАЖНО: пиши только обычный текст — без markdown, без звёздочек (*), без решёток (#), без таблиц с вертикальными чертами (|). 
+    from datetime import date
+    current_date = date.today().strftime("%d.%m.%Y")
+    system = f"""Ты умный личный ассистент. Сегодня {current_date}.
+Отвечай чётко и практично на русском языке.
+Если вопрос о текущих событиях — отвечай исходя из того что знаешь, но предупреждай если информация может быть устаревшей.
+Пиши только обычный текст — без markdown, без звёздочек (*), без решёток (#), без таблиц с вертикальными чертами (|).
 Используй обычные тире для списков."""
 
     context = ""
     if memories:
         context = f"Что ты знаешь о пользователе:\n{memories}\n\n"
+
+    # Web search if needed
+    if await needs_web_search(question):
+        search_results = await search_web(question)
+        if search_results:
+            context += f"Актуальные данные из интернета:\n{search_results}\n\n"
+
     context += f"Вопрос: {question}"
 
     response = await client.messages.create(
@@ -222,3 +233,36 @@ async def generate_advice(question: str, memories: str = "") -> str:
         messages=[{"role": "user", "content": context}],
     )
     return clean_markdown(response.content[0].text.strip())
+
+
+async def search_web(query: str) -> str:
+    """Search web via Tavily and return summary."""
+    try:
+        import os
+        from tavily import TavilyClient
+        api_key = os.environ.get("TAVILY_API_KEY", "")
+        if not api_key:
+            return ""
+        client = TavilyClient(api_key=api_key)
+        results = client.search(query, max_results=3, search_depth="basic")
+        snippets = []
+        for r in results.get("results", []):
+            title = r.get("title", "")
+            content = r.get("content", "")[:300]
+            snippets.append(f"{title}: {content}")
+        return "\n".join(snippets)
+    except Exception as e:
+        logger.error(f"Web search error: {e}")
+        return ""
+
+
+async def needs_web_search(question: str) -> bool:
+    """Ask Claude if this question needs fresh web data."""
+    response = await client.messages.create(
+        model=settings.CLAUDE_MODEL,
+        max_tokens=10,
+        system="Ответь только 'да' или 'нет'.",
+        messages=[{"role": "user", "content": 
+            f"Этот вопрос требует актуальных данных из интернета (новости, текущие события, результаты матчей, курсы валют, погода)? Вопрос: {question}"}],
+    )
+    return "да" in response.content[0].text.lower()
