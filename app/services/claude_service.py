@@ -1,14 +1,10 @@
 import json
 import logging
-from openai import AsyncOpenAI
+import anthropic
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
-
-client = AsyncOpenAI(
-    api_key=settings.ANTHROPIC_API_KEY,
-    base_url="https://openrouter.ai/api/v1",
-)
+client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 INTENT_SYSTEM_PROMPT = """Ты — ядро Telegram-бота личного ассистента. Твоя задача — определить намерение пользователя и вернуть JSON.
 
@@ -41,10 +37,6 @@ unknown
 """
 
 
-def _extract(response) -> str:
-    return response.choices[0].message.content.strip()
-
-
 async def detect_intent(user_message: str, today: str, memories: str = "") -> dict:
     context = f"Сегодня: {today}\n"
     if memories:
@@ -52,16 +44,13 @@ async def detect_intent(user_message: str, today: str, memories: str = "") -> di
     context += f"Сообщение: {user_message}"
 
     try:
-        response = await client.chat.completions.create(
+        response = await client.messages.create(
             model=settings.CLAUDE_MODEL,
             max_tokens=1000,
-            messages=[
-                {"role": "system", "content": INTENT_SYSTEM_PROMPT},
-                {"role": "user", "content": context},
-            ],
+            system=INTENT_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": context}],
         )
-        raw = _extract(response)
-        # Strip possible ```json fences
+        raw = response.content[0].text.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
         return json.loads(raw)
     except Exception as e:
@@ -93,12 +82,12 @@ async def generate_morning_report(tasks_today: list, tasks_overdue: list,
 
 Пиши кратко, по-русски, без markdown."""
 
-    response = await client.chat.completions.create(
+    response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
         max_tokens=1000,
         messages=[{"role": "user", "content": prompt}],
     )
-    return _extract(response)
+    return response.content[0].text.strip()
 
 
 async def generate_pdf_content(project_title: str, tasks: list,
@@ -116,12 +105,12 @@ async def generate_pdf_content(project_title: str, tasks: list,
 
 Напиши профессиональный отчёт в виде обычного текста, разделы через пустую строку."""
 
-    response = await client.chat.completions.create(
+    response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}],
     )
-    return _extract(response)
+    return response.content[0].text.strip()
 
 
 async def generate_image_prompt(user_request: str, project_context: str = "") -> str:
@@ -131,12 +120,12 @@ async def generate_image_prompt(user_request: str, project_context: str = "") ->
 
 Верни только улучшенный промпт на английском, одной строкой, без пояснений."""
 
-    response = await client.chat.completions.create(
+    response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
     )
-    return _extract(response)
+    return response.content[0].text.strip()
 
 
 async def analyze_training_progress(trainings: list, user_name: str) -> str:
@@ -157,12 +146,12 @@ async def analyze_training_progress(trainings: list, user_name: str) -> str:
 
 Пиши кратко, по-русски."""
 
-    response = await client.chat.completions.create(
+    response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
         max_tokens=500,
         messages=[{"role": "user", "content": prompt}],
     )
-    return _extract(response)
+    return response.content[0].text.strip()
 
 
 async def generate_advice(question: str, memories: str = "") -> str:
@@ -172,12 +161,10 @@ async def generate_advice(question: str, memories: str = "") -> str:
         context = f"Что ты знаешь о пользователе:\n{memories}\n\n"
     context += f"Вопрос: {question}"
 
-    response = await client.chat.completions.create(
+    response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
         max_tokens=800,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": context},
-        ],
+        system=system,
+        messages=[{"role": "user", "content": context}],
     )
-    return _extract(response)
+    return response.content[0].text.strip()
