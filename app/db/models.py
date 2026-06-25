@@ -135,7 +135,7 @@ class Task(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    user: Mapped["User"] = relationship(back_populates="tasks", foreign_keys=[user_id])
+    user: Mapped["User"] = relationship(back_populates="tasks", foreign_keys="[Task.user_id]")
     project: Mapped[Optional["Project"]] = relationship(back_populates="tasks")
     reminders: Mapped[List["Reminder"]] = relationship(back_populates="task")
 
@@ -257,3 +257,4 @@ class ImageGeneration(Base):
     final_prompt: Mapped[Optional[str]] = mapped_column(Text)
     image_url: Mapped[Optional[str]] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
