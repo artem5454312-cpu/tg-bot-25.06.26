@@ -18,6 +18,20 @@ from config.settings import settings
 router = Router()
 logger = logging.getLogger(__name__)
 
+# In-memory dialog history per user (last 6 messages)
+_dialog_history: dict = {}
+
+def _get_history(user_id: int) -> list:
+    return _dialog_history.get(user_id, [])
+
+def _add_to_history(user_id: int, role: str, content: str):
+    if user_id not in _dialog_history:
+        _dialog_history[user_id] = []
+    _dialog_history[user_id].append({"role": role, "content": content})
+    # Keep last 6 messages
+    if len(_dialog_history[user_id]) > 6:
+        _dialog_history[user_id] = _dialog_history[user_id][-6:]
+
 PRIORITY_MAP = {"low": TaskPriority.low, "medium": TaskPriority.medium, "high": TaskPriority.high}
 
 # Паттерны для локального определения без Claude
@@ -435,7 +449,14 @@ async def _handle_advice(message: Message, text: str):
     async with AsyncSessionLocal() as session:
         user = await repos.get_or_create_user(session, tg.id)
         memories = await repos.get_memories_summary(session, user.id)
-    answer = await claude_service.generate_advice(text, memories)
+
+    history = _get_history(tg.id)
+    answer = await claude_service.generate_advice(text, memories, history)
+
+    # Save to history
+    _add_to_history(tg.id, "user", text)
+    _add_to_history(tg.id, "assistant", answer)
+
     await message.answer(answer)
 
 
