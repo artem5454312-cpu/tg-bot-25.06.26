@@ -1,14 +1,15 @@
 import io
 import logging
-import re
 from datetime import date, datetime, timedelta
 from aiogram import Router, F, Bot
 from aiogram.types import Message, BufferedInputFile
 from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 from app.db.engine import AsyncSessionLocal
 from app.db import repos, task_repo
-from app.db.models import MemoryType, NoteType, TaskSource, TaskPriority, UserRole, TaskStatus
+from app.db.models import MemoryType, NoteType, TaskSource, TaskPriority, UserRole
 from app.keyboards import main_menu, confirm_delete_tasks
 from app.services import claude_service, voice_service, image_service, pdf_service
 from config.settings import settings
@@ -17,6 +18,10 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 PRIORITY_MAP = {"low": TaskPriority.low, "medium": TaskPriority.medium, "high": TaskPriority.high}
+
+
+class PhotoState(StatesGroup):
+    waiting_for_instruction = State()
 
 
 # ─── /start ──────────────────────────────────────────────────────────────────
@@ -55,33 +60,80 @@ async def cmd_start(message: Message):
     )
 
 
-# ─── Photo messages ───────────────────────────────────────────────────────────
+# ─── Photo: получили фото ─────────────────────────────────────────────────────
 
 @router.message(F.photo)
-async def handle_photo(message: Message, bot: Bot):
+async def handle_photo(message: Message, bot: Bot, state: FSMContext):
     caption = message.caption or ""
 
-    if not caption:
+    # Скачиваем фото сразу и сохраняем в FSM
+    photo = message.photo[-1]
+    file_info = await bot.get_file(photo.file_id)
+    photo_bytes_io = io.BytesIO()
+    await bot.download_file(file_info.file_path, photo_bytes_io)
+    photo_bytes = photo_bytes_io.getvalue()
+
+    await state.update_data(photo_bytes=photo_bytes)
+
+    if caption:
+        # Если подпись уже есть — сразу редактируем
+        await state.clear()
+        await _edit_photo(message, bot, photo_bytes, caption)
+    else:
+        # Ждём команду
+        await state.set_state(PhotoState.waiting_for_instruction)
         await message.answer(
-            "📸 Фото получил. Что с ним сделать?\n\n"
-            "Напиши команду прямо под фото, например:\n"
+            "📸 Фото получил!\n\n"
+            "Что сделать? Напиши или надиктуй голосом:\n"
             "— Поменяй цвет рубашки на белый\n"
             "— Убери фон\n"
+            "— Добавь надпись\n"
             "— Сделай фото ярче"
         )
+
+
+# ─── Photo: получили инструкцию текстом ──────────────────────────────────────
+
+@router.message(PhotoState.waiting_for_instruction, F.text)
+async def handle_photo_instruction_text(message: Message, bot: Bot, state: FSMContext):
+    data = await state.get_data()
+    photo_bytes = data.get("photo_bytes")
+    await state.clear()
+
+    if not photo_bytes:
+        await message.answer("Фото не найдено, отправь снова.")
         return
 
+    await _edit_photo(message, bot, photo_bytes, message.text)
+
+
+# ─── Photo: получили инструкцию голосом ──────────────────────────────────────
+
+@router.message(PhotoState.waiting_for_instruction, F.voice)
+async def handle_photo_instruction_voice(message: Message, bot: Bot, state: FSMContext):
+    data = await state.get_data()
+    photo_bytes = data.get("photo_bytes")
+    await state.clear()
+
+    if not photo_bytes:
+        await message.answer("Фото не найдено, отправь снова.")
+        return
+
+    await message.answer("🎙 Распознаю голос...")
+    try:
+        text = await voice_service.transcribe_voice(bot, message.voice)
+        await message.answer(f"📝 Распознано: <i>{text}</i>")
+        await _edit_photo(message, bot, photo_bytes, text)
+    except Exception as e:
+        logger.error(f"Voice error in photo state: {e}")
+        await message.answer("❌ Не удалось распознать голос.")
+
+
+async def _edit_photo(message: Message, bot: Bot, photo_bytes: bytes, instruction: str):
     await message.answer("🎨 Редактирую фото...")
     try:
-        photo = message.photo[-1]
-        file_info = await bot.get_file(photo.file_id)
-        photo_bytes_io = io.BytesIO()
-        await bot.download_file(file_info.file_path, photo_bytes_io)
-        photo_bytes = photo_bytes_io.getvalue()
-
-        edit_instruction = await claude_service.generate_photo_edit_prompt(caption)
+        edit_instruction = await claude_service.generate_photo_edit_prompt(instruction)
         result_bytes = await image_service.edit_photo(photo_bytes, edit_instruction)
-
         file = BufferedInputFile(result_bytes, filename="edited.png")
         await message.answer_photo(file, caption="✅ Готово!")
     except Exception as e:
@@ -92,7 +144,7 @@ async def handle_photo(message: Message, bot: Bot):
 # ─── Voice messages ───────────────────────────────────────────────────────────
 
 @router.message(F.voice)
-async def handle_voice(message: Message, bot: Bot):
+async def handle_voice(message: Message, bot: Bot, state: FSMContext):
     await message.answer("🎙 Распознаю голос...")
     try:
         text = await voice_service.transcribe_voice(bot, message.voice)
@@ -106,7 +158,7 @@ async def handle_voice(message: Message, bot: Bot):
 # ─── Free text ────────────────────────────────────────────────────────────────
 
 @router.message(F.text & ~F.text.startswith("/"))
-async def handle_text(message: Message):
+async def handle_text(message: Message, state: FSMContext):
     text = message.text.strip()
     if text in ["✅ Задачи", "📁 Проекты", "⚙️ Настройки"]:
         return
@@ -119,7 +171,7 @@ async def process_free_text(message: Message, text: str,
     tg = message.from_user
     today = date.today().isoformat()
 
-    # ── Detect "delete all" locally without Claude ──
+    # ── Локальные команды без Claude ──
     delete_all_patterns = [
         "удали все задачи", "удалить все задачи", "сотри все задачи",
         "убери все задачи", "очисти все задачи", "удали все",
@@ -128,7 +180,6 @@ async def process_free_text(message: Message, text: str,
         await _handle_delete_all_tasks(message)
         return
 
-    # ── Detect "delete done tasks" locally ──
     delete_done_patterns = [
         "удали выполненные", "удалить выполненные", "очисти выполненные",
         "убери выполненные", "удали все выполненные",
@@ -185,7 +236,7 @@ async def process_free_text(message: Message, text: str,
         await _handle_advice(message, text)
 
 
-# ─── Delete all / delete done ─────────────────────────────────────────────────
+# ─── Delete all / done ────────────────────────────────────────────────────────
 
 async def _handle_delete_all_tasks(message: Message):
     tg = message.from_user
@@ -199,10 +250,7 @@ async def _handle_delete_all_tasks(message: Message):
         if count:
             await repos.log_action(session, user.id, "delete_all_tasks",
                                     details={"count": count})
-    if count:
-        await message.answer(f"🗑 Удалил все задачи ({count} шт.)")
-    else:
-        await message.answer("Активных задач нет.")
+    await message.answer(f"🗑 Удалил все задачи ({count} шт.)" if count else "Активных задач нет.")
 
 
 async def _handle_delete_done_tasks(message: Message):
@@ -217,10 +265,7 @@ async def _handle_delete_done_tasks(message: Message):
         if count:
             await repos.log_action(session, user.id, "delete_done_tasks",
                                     details={"count": count})
-    if count:
-        await message.answer(f"🗑 Удалил выполненные задачи ({count} шт.)")
-    else:
-        await message.answer("Выполненных задач нет.")
+    await message.answer(f"🗑 Удалил выполненные ({count} шт.)" if count else "Выполненных задач нет.")
 
 
 # ─── Intent handlers ──────────────────────────────────────────────────────────
@@ -236,7 +281,6 @@ async def _handle_create_task(message: Message, data: dict, original: str,
             project = await repos.get_project_by_title(session, user.id, project_name)
             if project:
                 project_id = project.id
-
         task_date = _resolve_date(data.get("date"))
         task = await task_repo.create_task(
             session,
@@ -272,11 +316,9 @@ async def _handle_delete_task(message: Message, data: dict, original_text: str =
     async with AsyncSessionLocal() as session:
         user = await repos.get_or_create_user(session, tg.id)
         tasks = await task_repo.search_tasks_by_keywords(session, user.id, keywords)
-
         if not tasks:
             await message.answer("🔍 Задача не найдена.")
             return
-
         if len(tasks) == 1:
             await task_repo.soft_delete_task(session, tasks[0].id)
             await repos.log_action(session, user.id, "delete_task",
@@ -289,8 +331,7 @@ async def _handle_delete_task(message: Message, data: dict, original_text: str =
                 tm = f" {t.time}" if t.time else ""
                 lines.append(f"{i}. {t.title}{dt}{tm}")
             lines.append("\nКакую удалить?")
-            await message.answer("\n".join(lines),
-                                  reply_markup=confirm_delete_tasks(tasks[:5]))
+            await message.answer("\n".join(lines), reply_markup=confirm_delete_tasks(tasks[:5]))
 
 
 async def _handle_complete_task(message: Message, data: dict):
