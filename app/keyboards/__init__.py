@@ -83,11 +83,10 @@ def project_menu(project_id: int) -> InlineKeyboardMarkup:
 def settings_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="settings:users")],
-        [InlineKeyboardButton(text="🔐 Доступы", callback_data="settings:access")],
         [InlineKeyboardButton(text="🧠 Память бота", callback_data="settings:memory")],
-        [InlineKeyboardButton(text="⏰ Время отчёта", callback_data="settings:report_time")],
         [InlineKeyboardButton(text="🤖 Модели AI", callback_data="settings:models")],
         [InlineKeyboardButton(text="🧾 Логи", callback_data="settings:logs")],
+        [InlineKeyboardButton(text="🔄 Перезапустить бота", callback_data="settings:restart")],
     ])
 
 
