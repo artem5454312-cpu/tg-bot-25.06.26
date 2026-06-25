@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from datetime import date, datetime
 import anthropic
 from config.settings import settings
 
@@ -37,31 +38,46 @@ unknown
 Если не уверен — поставь clarification_needed: true и задай короткий вопрос.
 """
 
+AUTO_MEMORY_PROMPT = """Ты анализируешь сообщение пользователя и решаешь — есть ли в нём важный факт который стоит запомнить.
+
+Запоминать стоит:
+- Имена людей и их роли ("Игорь — клиент по бассейнам")
+- Предпочтения пользователя ("работаю до 22:00", "не люблю звонки утром")
+- Важные факты о проектах
+- Договорённости и решения
+
+НЕ запоминать:
+- Обычные вопросы и ответы
+- Задачи (они и так сохраняются)
+- Приветствия и мелочи
+
+Верни JSON:
+{
+  "should_remember": true/false,
+  "memory": "краткий факт для запоминания или null",
+  "importance": 1-10
+}
+
+Только JSON, без пояснений."""
+
 
 def clean_markdown(text: str) -> str:
-    """Remove markdown formatting for clean Telegram output."""
-    # Remove headers
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    # Remove bold/italic
     text = re.sub(r'\*{1,3}(.+?)\*{1,3}', r'\1', text)
     text = re.sub(r'_{1,2}(.+?)_{1,2}', r'\1', text)
-    # Remove markdown tables - convert to plain text
     lines = text.split('\n')
     clean_lines = []
     for line in lines:
         if re.match(r'^\s*\|[-:]+\|', line):
-            continue  # skip separator rows
+            continue
         if line.startswith('|') and line.endswith('|'):
-            # Convert table row to plain text
             cells = [c.strip() for c in line.strip('|').split('|')]
             clean_lines.append('  '.join(cells))
         else:
             clean_lines.append(line)
     text = '\n'.join(clean_lines)
-    # Remove code blocks
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
     text = re.sub(r'`(.+?)`', r'\1', text)
-    # Clean multiple empty lines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -87,10 +103,33 @@ async def detect_intent(user_message: str, today: str, memories: str = "") -> di
         return {"intent": "unknown", "clarification_needed": False}
 
 
+async def auto_extract_memory(message: str) -> dict:
+    """Automatically extract important facts from user message."""
+    try:
+        response = await client.messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=200,
+            system=AUTO_MEMORY_PROMPT,
+            messages=[{"role": "user", "content": message}],
+        )
+        raw = response.content[0].text.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        return json.loads(raw)
+    except Exception as e:
+        logger.error(f"Auto memory error: {e}")
+        return {"should_remember": False}
+
+
 async def generate_morning_report(tasks_today: list, tasks_overdue: list,
                                    tasks_no_time: list, user_name: str,
                                    today: str) -> str:
+    # Формируем анализ просроченных
+    overdue_analysis = ""
+    if tasks_overdue:
+        overdue_analysis = f"\nПросроченных задач: {len(tasks_overdue)}. Это важно упомянуть и подтолкнуть закрыть."
+
     prompt = f"""Сгенерируй утренний план дня для {user_name} на {today}.
+{overdue_analysis}
 
 Задачи на сегодня:
 {json.dumps(tasks_today, ensure_ascii=False, indent=2)}
@@ -101,15 +140,15 @@ async def generate_morning_report(tasks_today: list, tasks_overdue: list,
 Задачи без времени:
 {json.dumps(tasks_no_time, ensure_ascii=False, indent=2)}
 
-Формат ответа — простой текст БЕЗ markdown, без звёздочек, без решёток:
+Формат — простой текст БЕЗ markdown:
 Доброе утро, [имя].
 Сегодня N задач.
-...список задач...
-Просроченные задачи:...
+...список...
+Просроченные:...
 Главный фокус:...
-Комментарий:...
+Комментарий (короткий, по делу, как мудрый советник):...
 
-Пиши кратко, по-русски, ТОЛЬКО обычный текст."""
+Пиши кратко, по-русски, только обычный текст."""
 
     response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
@@ -132,7 +171,7 @@ async def generate_pdf_content(project_title: str, tasks: list,
 Важная информация:
 {json.dumps(memories, ensure_ascii=False, indent=2)}
 
-Напиши профессиональный отчёт. Используй только обычный текст, разделы обозначай строкой с двоеточием в конце. Без markdown, без звёздочек."""
+Напиши профессиональный отчёт. Только обычный текст, разделы обозначай строкой с двоеточием. Без markdown."""
 
     response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
@@ -149,12 +188,12 @@ async def generate_image_prompt(user_request: str, project_context: str = "") ->
 Контекст проекта: {project_context}
 Запрос пользователя: {user_request}
 
-Требования к промпту:
+Требования:
 - Детальное описание композиции, освещения, стиля
 - Укажи стиль: photorealistic / cinematic / commercial photography
-- Добавь детали про качество: 8k, sharp focus, professional lighting
-- Для вертикальных форматов (рилс, сторис) укажи: vertical composition 9:16
-- Верни ТОЛЬКО промпт на английском, одной строкой, без пояснений."""
+- Добавь: 8k, sharp focus, professional lighting
+- Для вертикальных форматов: vertical composition 9:16
+- Верни ТОЛЬКО промпт на английском, одной строкой."""
 
     response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
@@ -165,11 +204,9 @@ async def generate_image_prompt(user_request: str, project_context: str = "") ->
 
 
 async def generate_photo_edit_prompt(user_request: str) -> str:
-    """Generate edit instruction for GPT Image photo editing."""
     prompt = f"""Пользователь хочет отредактировать фото. Его запрос: "{user_request}"
-
 Сформулируй чёткую инструкцию для редактирования на английском языке.
-Верни ТОЛЬКО инструкцию одной строкой, без пояснений."""
+Верни ТОЛЬКО инструкцию одной строкой."""
 
     response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
@@ -193,9 +230,9 @@ async def analyze_training_progress(trainings: list, user_name: str) -> str:
 - Общая дистанция
 - Средняя дистанция
 - Лучший результат
-- Короткий комментарий
+- Короткий комментарий по прогрессу
 
-Пиши кратко, по-русски, только обычный текст."""
+Пиши кратко, по-русски."""
 
     response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
@@ -205,14 +242,75 @@ async def analyze_training_progress(trainings: list, user_name: str) -> str:
     return clean_markdown(response.content[0].text.strip())
 
 
+async def search_web(query: str) -> str:
+    """Search web via Tavily."""
+    try:
+        import os
+        from tavily import TavilyClient
+        api_key = os.environ.get("TAVILY_API_KEY", "")
+        if not api_key:
+            return ""
+        client_tavily = TavilyClient(api_key=api_key)
+        results = client_tavily.search(query, max_results=3, search_depth="basic")
+        snippets = []
+        for r in results.get("results", []):
+            title = r.get("title", "")
+            content = r.get("content", "")[:400]
+            snippets.append(f"{title}: {content}")
+        return "\n".join(snippets)
+    except Exception as e:
+        logger.error(f"Web search error: {e}")
+        return ""
+
+
+async def needs_web_search(question: str) -> bool:
+    """Check if question needs fresh web data."""
+    try:
+        response = await client.messages.create(
+            model=settings.CLAUDE_MODEL,
+            max_tokens=10,
+            system="Ответь только 'да' или 'нет'.",
+            messages=[{"role": "user", "content":
+                f"Этот вопрос требует актуальных данных из интернета (новости, текущие события, результаты матчей, курсы валют, погода, цены)? Вопрос: {question}"}],
+        )
+        return "да" in response.content[0].text.lower()
+    except Exception:
+        return False
+
+
+async def generate_proactive_message(stale_tasks: list, user_name: str) -> str:
+    """Generate proactive message about stale tasks."""
+    prompt = f"""Ты личный ассистент {user_name}. У пользователя есть задачи которые висят давно и не закрыты.
+
+Задачи:
+{json.dumps(stale_tasks, ensure_ascii=False, indent=2)}
+
+Напиши короткое проактивное сообщение — как мудрый советник, без занудства.
+Спроси что с этими задачами, предложи закрыть или перенести.
+Максимум 3-4 строки. Только обычный текст, без markdown."""
+
+    response = await client.messages.create(
+        model=settings.CLAUDE_MODEL,
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return clean_markdown(response.content[0].text.strip())
+
+
 async def generate_advice(question: str, memories: str = "") -> str:
-    from datetime import date
     current_date = date.today().strftime("%d.%m.%Y")
-    system = f"""Ты умный личный ассистент. Сегодня {current_date}.
-Отвечай чётко и практично на русском языке.
-Если вопрос о текущих событиях — отвечай исходя из того что знаешь, но предупреждай если информация может быть устаревшей.
-Пиши только обычный текст — без markdown, без звёздочек (*), без решёток (#), без таблиц с вертикальными чертами (|).
-Используй обычные тире для списков."""
+    system = f"""Ты мудрый личный ассистент. Сегодня {current_date}.
+
+Стиль общения:
+- Отвечай кратко и по делу — если вопрос простой, 2-4 строки максимум
+- Если нужен развёрнутый ответ — пиши развёрнуто, но без воды
+- Говори как умный друг, а не как справочник
+- Если знаешь человека по памяти — используй это в ответе
+- Если вопрос о текущих событиях и есть данные из поиска — опирайся на них
+- Если информация может быть устаревшей — честно скажи об этом
+
+Формат: только обычный текст, без markdown, без звёздочек, без решёток, без таблиц.
+Используй тире для списков."""
 
     context = ""
     if memories:
@@ -235,34 +333,30 @@ async def generate_advice(question: str, memories: str = "") -> str:
     return clean_markdown(response.content[0].text.strip())
 
 
-async def search_web(query: str) -> str:
-    """Search web via Tavily and return summary."""
-    try:
-        import os
-        from tavily import TavilyClient
-        api_key = os.environ.get("TAVILY_API_KEY", "")
-        if not api_key:
-            return ""
-        client = TavilyClient(api_key=api_key)
-        results = client.search(query, max_results=3, search_depth="basic")
-        snippets = []
-        for r in results.get("results", []):
-            title = r.get("title", "")
-            content = r.get("content", "")[:300]
-            snippets.append(f"{title}: {content}")
-        return "\n".join(snippets)
-    except Exception as e:
-        logger.error(f"Web search error: {e}")
-        return ""
+async def analyze_photo(photo_bytes: bytes, instruction: str) -> str:
+    """Analyze photo using Claude Vision."""
+    import base64
+    image_data = base64.standard_b64encode(photo_bytes).decode("utf-8")
 
-
-async def needs_web_search(question: str) -> bool:
-    """Ask Claude if this question needs fresh web data."""
     response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
-        max_tokens=10,
-        system="Ответь только 'да' или 'нет'.",
-        messages=[{"role": "user", "content": 
-            f"Этот вопрос требует актуальных данных из интернета (новости, текущие события, результаты матчей, курсы валют, погода)? Вопрос: {question}"}],
+        max_tokens=1000,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_data,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": f"{instruction}\n\nОтвечай на русском языке, кратко и по делу. Без markdown."
+                }
+            ],
+        }],
     )
-    return "да" in response.content[0].text.lower()
+    return clean_markdown(response.content[0].text.strip())
