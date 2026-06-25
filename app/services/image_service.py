@@ -47,7 +47,7 @@ async def edit_photo(image_bytes: bytes, instruction: str) -> bytes:
         image=("image.png", png_buffer, "image/png"),
         prompt=instruction,
         n=1,
-        size="1024x1024",
+        size="1024x1536",
     )
     image_data = response.data[0]
 
