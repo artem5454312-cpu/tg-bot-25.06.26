@@ -462,11 +462,10 @@ async def _handle_advice(message: Message, text: str):
 
 async def _handle_create_pdf(message: Message, data: dict):
     import asyncio
-    project_name = data.get("project") or data.get("title", "Отчёт")
+    project_name = data.get("project") or data.get("title", "Отчет")
     tg = message.from_user
-    await message.answer("Готовлю PDF: <b>" + project_name + "</b>...
-
-Это займет ~15 секунд.")
+    msg = "Готовлю PDF: <b>" + project_name + "</b>... Займет ~15 секунд."
+    await message.answer(msg)
 
     async def _generate():
         try:
@@ -488,13 +487,12 @@ async def _handle_create_pdf(message: Message, data: dict):
                 project_name, tasks_data, [], memories_data
             )
             pdf_bytes = pdf_service.generate_pdf(project_name, pdf_content)
-            file = BufferedInputFile(pdf_bytes, filename=f"{project_name}.pdf")
-            await message.answer_document(file, caption=f"📄 PDF готов: «{project_name}»")
+            file = BufferedInputFile(pdf_bytes, filename=project_name + ".pdf")
+            await message.answer_document(file, caption="PDF готов: " + project_name)
         except Exception as e:
-            logger.error(f"PDF generation error: {e}")
-            await message.answer("❌ Не удалось создать PDF. Попробуй ещё раз.")
+            logger.error("PDF generation error: " + str(e))
+            await message.answer("Не удалось создать PDF. Попробуй ещё раз.")
 
-    # Запускаем как фоновую задачу — не прерывается другими апдейтами
     asyncio.create_task(_generate())
 
 
