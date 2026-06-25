@@ -5,6 +5,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import select, delete
 
+import sys
+import asyncio
+import os
 from app.db.engine import AsyncSessionLocal
 from app.db import repos
 from app.db.models import AdminSession, UserRole, Memory, User
@@ -136,6 +139,12 @@ async def settings_callback(call: CallbackQuery, state: FSMContext):
             f"Image: <code>{settings.IMAGE_MODEL}</code>",
             reply_markup=settings_menu()
         )
+
+    elif action == "restart":
+        await call.message.edit_text("🔄 Перезапускаю бота...")
+        await call.answer()
+        await asyncio.sleep(1)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     elif action == "back":
         await call.message.edit_text("⚙️ Настройки:", reply_markup=settings_menu())
