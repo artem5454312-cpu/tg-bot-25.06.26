@@ -461,28 +461,41 @@ async def _handle_advice(message: Message, text: str):
 
 
 async def _handle_create_pdf(message: Message, data: dict):
+    import asyncio
     project_name = data.get("project") or data.get("title", "Отчёт")
     tg = message.from_user
-    await message.answer(f"📄 Готовлю PDF по проекту <b>{project_name}</b>...")
-    async with AsyncSessionLocal() as session:
-        user = await repos.get_or_create_user(session, tg.id)
-        project = await repos.get_project_by_title(session, user.id, project_name)
-        project_id = project.id if project else None
-        tasks = await task_repo.get_all_active_tasks(session, user.id)
-        if project_id:
-            tasks = [t for t in tasks if t.project_id == project_id]
-        tasks_data = [{"title": t.title, "date": t.date, "status": t.status.value}
-                      for t in tasks]
-        memories_data = []
-        if project_id:
-            mems = await repos.get_user_memories(session, user.id, project_id=project_id)
-            memories_data = [m.content for m in mems]
-    content = await claude_service.generate_pdf_content(
-        project_name, tasks_data, [], memories_data
-    )
-    pdf_bytes = pdf_service.generate_pdf(project_name, content)
-    file = BufferedInputFile(pdf_bytes, filename=f"{project_name}.pdf")
-    await message.answer_document(file, caption=f"📄 PDF по проекту «{project_name}»")
+    await message.answer(f"📄 Готовлю PDF: <b>{project_name}</b>...
+
+Это займёт ~15 секунд, не переключайся 🙏")
+
+    async def _generate():
+        try:
+            async with AsyncSessionLocal() as session:
+                user = await repos.get_or_create_user(session, tg.id)
+                project = await repos.get_project_by_title(session, user.id, project_name)
+                project_id = project.id if project else None
+                tasks = await task_repo.get_all_active_tasks(session, user.id)
+                if project_id:
+                    tasks = [t for t in tasks if t.project_id == project_id]
+                tasks_data = [{"title": t.title, "date": t.date, "status": t.status.value}
+                              for t in tasks]
+                memories_data = []
+                if project_id:
+                    mems = await repos.get_user_memories(session, user.id, project_id=project_id)
+                    memories_data = [m.content for m in mems]
+
+            pdf_content = await claude_service.generate_pdf_content(
+                project_name, tasks_data, [], memories_data
+            )
+            pdf_bytes = pdf_service.generate_pdf(project_name, pdf_content)
+            file = BufferedInputFile(pdf_bytes, filename=f"{project_name}.pdf")
+            await message.answer_document(file, caption=f"📄 PDF готов: «{project_name}»")
+        except Exception as e:
+            logger.error(f"PDF generation error: {e}")
+            await message.answer("❌ Не удалось создать PDF. Попробуй ещё раз.")
+
+    # Запускаем как фоновую задачу — не прерывается другими апдейтами
+    asyncio.create_task(_generate())
 
 
 async def _handle_generate_image(message: Message, text: str):
