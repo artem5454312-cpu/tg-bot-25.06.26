@@ -1,13 +1,17 @@
+import io
 import logging
+import re
 from datetime import date, datetime, timedelta
 from aiogram import Router, F, Bot
 from aiogram.types import Message, BufferedInputFile
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 from app.db.engine import AsyncSessionLocal
 from app.db import repos, task_repo
 from app.db.models import MemoryType, NoteType, TaskSource, TaskPriority, UserRole
-from app.keyboards import main_menu
+from app.keyboards import main_menu, confirm_delete_tasks
 from app.services import claude_service, voice_service, image_service, pdf_service
 from config.settings import settings
 
@@ -15,6 +19,21 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 PRIORITY_MAP = {"low": TaskPriority.low, "medium": TaskPriority.medium, "high": TaskPriority.high}
+
+# Паттерны для локального определения без Claude
+DELETE_ALL_PATTERNS = [
+    "удали все задачи", "удалить все задачи", "сотри все задачи",
+    "убери все задачи", "очисти все задачи", "удали все", "удали задачи",
+    "удалить задачи", "сотри задачи", "убери задачи",
+]
+DELETE_DONE_PATTERNS = [
+    "удали выполненные", "удалить выполненные", "очисти выполненные",
+    "убери выполненные", "удали все выполненные",
+]
+
+
+class PhotoState(StatesGroup):
+    waiting_for_instruction = State()
 
 
 # ─── /start ──────────────────────────────────────────────────────────────────
@@ -26,13 +45,10 @@ async def cmd_start(message: Message):
         user = await repos.get_or_create_user(
             session, tg.id, tg.username, tg.first_name, tg.last_name
         )
-
-        # Auto-assign owner role on first launch
         from config.settings import settings as s
         if tg.id == s.OWNER_TELEGRAM_ID and user.role != UserRole.owner:
             await repos.set_user_role(session, user.id, UserRole.owner)
 
-        # Check invite from deep link  e.g. /start invite_XXXXXXXX
         args = message.text.split()
         if len(args) > 1 and args[1].startswith("invite_"):
             code = args[1][len("invite_"):]
@@ -56,7 +72,95 @@ async def cmd_start(message: Message):
     )
 
 
-# ─── Voice messages ──────────────────────────────────────────────────────────
+# ─── Photo ────────────────────────────────────────────────────────────────────
+
+@router.message(F.photo)
+async def handle_photo(message: Message, bot: Bot, state: FSMContext):
+    caption = message.caption or ""
+
+    # Скачиваем фото
+    photo = message.photo[-1]
+    file_info = await bot.get_file(photo.file_id)
+    photo_bytes_io = io.BytesIO()
+    await bot.download_file(file_info.file_path, photo_bytes_io)
+    photo_bytes = photo_bytes_io.getvalue()
+
+    await state.update_data(photo_bytes=photo_bytes)
+
+    if caption:
+        await state.clear()
+        await _process_photo_instruction(message, bot, photo_bytes, caption)
+    else:
+        await state.set_state(PhotoState.waiting_for_instruction)
+        await message.answer(
+            "📸 Фото получил!\n\n"
+            "Что сделать? Напиши или надиктуй голосом:\n"
+            "— Опиши что на фото\n"
+            "— Поменяй цвет рубашки на белый\n"
+            "— Убери фон\n"
+            "— Сделай ярче"
+        )
+
+
+@router.message(PhotoState.waiting_for_instruction, F.text)
+async def photo_instruction_text(message: Message, bot: Bot, state: FSMContext):
+    data = await state.get_data()
+    photo_bytes = data.get("photo_bytes")
+    await state.clear()
+    if not photo_bytes:
+        await message.answer("Фото не найдено, отправь снова.")
+        return
+    await _process_photo_instruction(message, bot, photo_bytes, message.text)
+
+
+@router.message(PhotoState.waiting_for_instruction, F.voice)
+async def photo_instruction_voice(message: Message, bot: Bot, state: FSMContext):
+    data = await state.get_data()
+    photo_bytes = data.get("photo_bytes")
+    await state.clear()
+    if not photo_bytes:
+        await message.answer("Фото не найдено, отправь снова.")
+        return
+    await message.answer("🎙 Распознаю голос...")
+    try:
+        text = await voice_service.transcribe_voice(bot, message.voice)
+        await message.answer(f"📝 Распознано: <i>{text}</i>")
+        await _process_photo_instruction(message, bot, photo_bytes, text)
+    except Exception as e:
+        logger.error(f"Voice error: {e}")
+        await message.answer("❌ Не удалось распознать голос.")
+
+
+async def _process_photo_instruction(message: Message, bot: Bot,
+                                      photo_bytes: bytes, instruction: str):
+    """Decide: analyze or edit photo based on instruction."""
+    instr_lower = instruction.lower()
+
+    # Если просят описать/проанализировать — используем Claude Vision
+    analyze_keywords = ["опиши", "что на фото", "что здесь", "анализ", "расскажи",
+                        "что это", "кто это", "что видишь", "посмотри"]
+    if any(k in instr_lower for k in analyze_keywords):
+        await message.answer("🔍 Анализирую фото...")
+        try:
+            result = await claude_service.analyze_photo(photo_bytes, instruction)
+            await message.answer(result)
+        except Exception as e:
+            logger.error(f"Photo analysis error: {e}")
+            await message.answer("❌ Не удалось проанализировать фото.")
+    else:
+        # Иначе — редактируем через GPT Image
+        await message.answer("🎨 Редактирую фото...")
+        try:
+            edit_instruction = await claude_service.generate_photo_edit_prompt(instruction)
+            result_bytes = await image_service.edit_photo(photo_bytes, edit_instruction)
+            file = BufferedInputFile(result_bytes, filename="edited.png")
+            await message.answer_photo(file, caption="✅ Готово!")
+        except Exception as e:
+            logger.error(f"Photo edit error: {e}")
+            await message.answer("❌ Не удалось отредактировать фото.")
+
+
+# ─── Voice ────────────────────────────────────────────────────────────────────
 
 @router.message(F.voice)
 async def handle_voice(message: Message, bot: Bot):
@@ -67,19 +171,16 @@ async def handle_voice(message: Message, bot: Bot):
         await process_free_text(message, text, source=TaskSource.voice, transcript=text)
     except Exception as e:
         logger.error(f"Voice error: {e}")
-        await message.answer("❌ Не удалось распознать голосовое. Попробуй ещё раз.")
+        await message.answer("❌ Не удалось распознать голосовое.")
 
 
-# ─── Free text ───────────────────────────────────────────────────────────────
+# ─── Text ─────────────────────────────────────────────────────────────────────
 
 @router.message(F.text & ~F.text.startswith("/"))
-async def handle_text(message: Message):
+async def handle_text(message: Message, state: FSMContext):
     text = message.text.strip()
-
-    # Menu buttons handled by other routers
     if text in ["✅ Задачи", "📁 Проекты", "⚙️ Настройки"]:
         return
-
     await process_free_text(message, text)
 
 
@@ -88,6 +189,16 @@ async def process_free_text(message: Message, text: str,
                               transcript: str = None):
     tg = message.from_user
     today = date.today().isoformat()
+    text_lower = text.lower()
+
+    # ── Локальные команды — без Claude ──
+    if any(p in text_lower for p in DELETE_ALL_PATTERNS):
+        await _handle_delete_all_tasks(message)
+        return
+
+    if any(p in text_lower for p in DELETE_DONE_PATTERNS):
+        await _handle_delete_done_tasks(message)
+        return
 
     async with AsyncSessionLocal() as session:
         user = await repos.get_or_create_user(session, tg.id, tg.username,
@@ -97,16 +208,30 @@ async def process_free_text(message: Message, text: str,
 
     intent = intent_data.get("intent", "unknown")
 
-    # ── Clarification needed ──
+    # ── Автозапоминание ──
+    if intent not in ("save_memory", "ask_memory", "open_tasks",
+                       "open_projects", "open_settings"):
+        try:
+            mem_result = await claude_service.auto_extract_memory(text)
+            if mem_result.get("should_remember") and mem_result.get("memory"):
+                async with AsyncSessionLocal() as session:
+                    user2 = await repos.get_or_create_user(session, tg.id)
+                    await repos.save_memory(
+                        session, user2.id,
+                        content=mem_result["memory"],
+                        importance=mem_result.get("importance", 5),
+                    )
+        except Exception as e:
+            logger.error(f"Auto memory error: {e}")
+
     if intent_data.get("clarification_needed"):
         await message.answer(intent_data.get("clarification_question", "Уточни, пожалуйста."))
         return
 
-    # ── Route by intent ──
     if intent == "create_task":
         await _handle_create_task(message, intent_data, text, source, transcript)
     elif intent == "delete_task":
-        await _handle_delete_task(message, intent_data)
+        await _handle_delete_task(message, intent_data, text)
     elif intent == "complete_task":
         await _handle_complete_task(message, intent_data)
     elif intent == "create_project":
@@ -136,29 +261,59 @@ async def process_free_text(message: Message, text: str,
         from app.handlers.projects import show_projects_list
         await show_projects_list(message)
     else:
-        # Fallback: treat as advice/question
         await _handle_advice(message, text)
 
 
-# ─── Intent handlers ─────────────────────────────────────────────────────────
+# ─── Delete all / done ────────────────────────────────────────────────────────
+
+async def _handle_delete_all_tasks(message: Message):
+    tg = message.from_user
+    async with AsyncSessionLocal() as session:
+        user = await repos.get_or_create_user(session, tg.id)
+        tasks = await task_repo.get_all_active_tasks(session, user.id)
+        count = 0
+        for task in tasks:
+            await task_repo.soft_delete_task(session, task.id)
+            count += 1
+        if count:
+            await repos.log_action(session, user.id, "delete_all_tasks",
+                                    details={"count": count})
+    await message.answer(
+        f"🗑 Удалил все задачи ({count} шт.)" if count else "Активных задач нет."
+    )
+
+
+async def _handle_delete_done_tasks(message: Message):
+    tg = message.from_user
+    async with AsyncSessionLocal() as session:
+        user = await repos.get_or_create_user(session, tg.id)
+        tasks = await task_repo.get_done_tasks(session, user.id)
+        count = 0
+        for task in tasks:
+            await task_repo.soft_delete_task(session, task.id)
+            count += 1
+        if count:
+            await repos.log_action(session, user.id, "delete_done_tasks",
+                                    details={"count": count})
+    await message.answer(
+        f"🗑 Удалил выполненные ({count} шт.)" if count else "Выполненных задач нет."
+    )
+
+
+# ─── Intent handlers ──────────────────────────────────────────────────────────
 
 async def _handle_create_task(message: Message, data: dict, original: str,
                                source: TaskSource, transcript: str):
     tg = message.from_user
     async with AsyncSessionLocal() as session:
         user = await repos.get_or_create_user(session, tg.id)
-
-        # Resolve project
         project_id = None
         project_name = data.get("project")
         if project_name:
             project = await repos.get_project_by_title(session, user.id, project_name)
             if project:
                 project_id = project.id
-
-        # Parse date
         task_date = _resolve_date(data.get("date"))
-
         task = await task_repo.create_task(
             session,
             user_id=user.id,
@@ -173,7 +328,6 @@ async def _handle_create_task(message: Message, data: dict, original: str,
             transcript=transcript,
             reminder_time=data.get("reminder_time"),
         )
-
         await repos.log_action(session, user.id, "create_task",
                                 details={"task_id": task.id, "title": task.title})
 
@@ -185,36 +339,31 @@ async def _handle_create_task(message: Message, data: dict, original: str,
         parts.append(f"<b>Проект:</b> {project_name}")
     if task.reminder_time:
         parts.append("Напомню. 🔔")
-
     await message.answer("\n".join(parts))
 
 
-async def _handle_delete_task(message: Message, data: dict):
+async def _handle_delete_task(message: Message, data: dict, original_text: str = ""):
     tg = message.from_user
-    keywords = data.get("title", "")
+    keywords = data.get("title", "") or original_text
     async with AsyncSessionLocal() as session:
         user = await repos.get_or_create_user(session, tg.id)
         tasks = await task_repo.search_tasks_by_keywords(session, user.id, keywords)
-
         if not tasks:
             await message.answer("🔍 Задача не найдена.")
             return
-
         if len(tasks) == 1:
             await task_repo.soft_delete_task(session, tasks[0].id)
             await repos.log_action(session, user.id, "delete_task",
                                     details={"task_id": tasks[0].id})
             await message.answer(f"🗑 Удалил задачу:\n\n<b>{tasks[0].title}</b>")
         else:
-            from app.keyboards import confirm_delete_tasks
             lines = ["Нашёл несколько похожих задач:\n"]
             for i, t in enumerate(tasks[:5], 1):
                 dt = f" — {_format_date(t.date)}" if t.date else ""
                 tm = f" {t.time}" if t.time else ""
                 lines.append(f"{i}. {t.title}{dt}{tm}")
             lines.append("\nКакую удалить?")
-            await message.answer("\n".join(lines),
-                                  reply_markup=confirm_delete_tasks(tasks[:5]))
+            await message.answer("\n".join(lines), reply_markup=confirm_delete_tasks(tasks[:5]))
 
 
 async def _handle_complete_task(message: Message, data: dict):
@@ -247,12 +396,10 @@ async def _handle_save_memory(message: Message, data: dict, original: str):
     tg = message.from_user
     content = data.get("description") or data.get("title") or original
     project_name = data.get("project")
-
     async with AsyncSessionLocal() as session:
         user = await repos.get_or_create_user(session, tg.id)
         project_id = None
         mem_type = MemoryType.personal
-
         if project_name:
             project = await repos.get_project_by_title(session, user.id, project_name)
             if project:
@@ -260,10 +407,8 @@ async def _handle_save_memory(message: Message, data: dict, original: str):
                 mem_type = MemoryType.project
         elif data.get("intent") == "project_note" and not project_name:
             mem_type = MemoryType.global_memory
-
         await repos.save_memory(session, user.id, content,
                                  memory_type=mem_type, project_id=project_id)
-
     await message.answer(f"🧠 Запомнил:\n\n<i>{content[:200]}</i>")
 
 
@@ -278,7 +423,6 @@ async def _handle_ask_memory(message: Message, data: dict):
             if project:
                 project_id = project.id
         summary = await repos.get_memories_summary(session, user.id, project_id)
-
     if summary:
         label = f"по проекту {project_name}" if project_name else "о тебе"
         await message.answer(f"🧠 Что я помню {label}:\n\n{summary}")
@@ -299,26 +443,21 @@ async def _handle_create_pdf(message: Message, data: dict):
     project_name = data.get("project") or data.get("title", "Отчёт")
     tg = message.from_user
     await message.answer(f"📄 Готовлю PDF по проекту <b>{project_name}</b>...")
-
     async with AsyncSessionLocal() as session:
         user = await repos.get_or_create_user(session, tg.id)
         project = await repos.get_project_by_title(session, user.id, project_name)
         project_id = project.id if project else None
-
         tasks = await task_repo.get_all_active_tasks(session, user.id)
         if project_id:
             tasks = [t for t in tasks if t.project_id == project_id]
-        tasks_data = [{"title": t.title, "date": t.date, "status": t.status.value} for t in tasks]
-
-        notes_data = []
+        tasks_data = [{"title": t.title, "date": t.date, "status": t.status.value}
+                      for t in tasks]
         memories_data = []
         if project_id:
-            mems = await repos.get_user_memories(session, user.id,
-                                                  project_id=project_id)
+            mems = await repos.get_user_memories(session, user.id, project_id=project_id)
             memories_data = [m.content for m in mems]
-
     content = await claude_service.generate_pdf_content(
-        project_name, tasks_data, notes_data, memories_data
+        project_name, tasks_data, [], memories_data
     )
     pdf_bytes = pdf_service.generate_pdf(project_name, content)
     file = BufferedInputFile(pdf_bytes, filename=f"{project_name}.pdf")
@@ -326,13 +465,12 @@ async def _handle_create_pdf(message: Message, data: dict):
 
 
 async def _handle_generate_image(message: Message, text: str):
-    tg = message.from_user
     await message.answer("🎨 Генерирую изображение...")
     try:
         improved_prompt = await claude_service.generate_image_prompt(text)
         image_bytes = await image_service.generate_image(improved_prompt)
         file = BufferedInputFile(image_bytes, filename="image.png")
-        await message.answer_photo(file, caption=f"🎨 Готово!")
+        await message.answer_photo(file, caption="🎨 Готово!")
     except Exception as e:
         logger.error(f"Image generation error: {e}")
         await message.answer("❌ Не удалось сгенерировать изображение.")
@@ -344,26 +482,21 @@ async def _handle_training_record(message: Message, data: dict, original: str,
     raw = data.get("data", {})
     distance = raw.get("distance_km")
     duration = raw.get("duration_minutes")
-
-    # Try to parse date
     recorded_at = datetime.utcnow()
     if data.get("date"):
         try:
             recorded_at = datetime.strptime(_resolve_date(data["date"]), "%Y-%m-%d")
         except Exception:
             pass
-
-    content = original
-    title = f"Тренировка"
+    title = "Тренировка"
     if distance:
         title += f" {distance} км"
-
     async with AsyncSessionLocal() as session:
         user = await repos.get_or_create_user(session, tg.id)
         await repos.create_note(
             session, user.id,
             note_type=NoteType.training,
-            content=content,
+            content=original,
             title=title,
             data_json={"distance_km": distance, "duration_minutes": duration},
             source=source,
@@ -371,12 +504,9 @@ async def _handle_training_record(message: Message, data: dict, original: str,
             transcript=transcript,
             recorded_at=recorded_at,
         )
-
     parts = ["✅ Записал тренировку.\n"]
-    if recorded_at.date() == date.today():
-        parts.append("📅 Дата: сегодня")
-    else:
-        parts.append(f"📅 Дата: {recorded_at.strftime('%d.%m.%Y')}")
+    parts.append("📅 Дата: сегодня" if recorded_at.date() == date.today()
+                 else f"📅 Дата: {recorded_at.strftime('%d.%m.%Y')}")
     if distance:
         parts.append(f"🏃 Дистанция: {distance} км")
     if duration:
@@ -390,11 +520,8 @@ async def _handle_training_progress(message: Message):
         user = await repos.get_or_create_user(session, tg.id)
         trainings = await repos.get_trainings(session, user.id)
         trainings_data = [
-            {
-                "date": t.recorded_at.strftime("%d.%m.%Y") if t.recorded_at else None,
-                **(t.data_json or {}),
-            }
-            for t in trainings
+            {"date": t.recorded_at.strftime("%d.%m.%Y") if t.recorded_at else None,
+             **(t.data_json or {})} for t in trainings
         ]
     result = await claude_service.analyze_training_progress(
         trainings_data, tg.first_name or "пользователь"
@@ -404,14 +531,13 @@ async def _handle_training_progress(message: Message):
 
 async def _handle_training_progress_image(message: Message):
     tg = message.from_user
-    await message.answer("📊 Готовлю визуальный отчёт по тренировкам...")
+    await message.answer("📊 Готовлю визуальный отчёт...")
     async with AsyncSessionLocal() as session:
         user = await repos.get_or_create_user(session, tg.id)
         trainings = await repos.get_trainings(session, user.id)
         trainings_data = [
             {"date": t.recorded_at.strftime("%d.%m.%Y") if t.recorded_at else None,
-             **(t.data_json or {})}
-            for t in trainings
+             **(t.data_json or {})} for t in trainings
         ]
     summary = await claude_service.analyze_training_progress(
         trainings_data, tg.first_name or "пользователь"
@@ -443,10 +569,9 @@ async def _handle_create_note(message: Message, data: dict, original: str,
     await message.answer(f"📝 Записал заметку:\n\n<i>{content[:200]}</i>")
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _resolve_date(date_str: str) -> str:
-    """Convert relative dates to YYYY-MM-DD."""
     if not date_str:
         return None
     today = date.today()
@@ -456,7 +581,6 @@ def _resolve_date(date_str: str) -> str:
         return (today + timedelta(days=1)).isoformat()
     if date_str in ("yesterday", "вчера"):
         return (today - timedelta(days=1)).isoformat()
-    # Already in YYYY-MM-DD
     return date_str
 
 
@@ -468,6 +592,8 @@ def _format_date(date_str: str) -> str:
             return "сегодня"
         if d.date() == today + timedelta(days=1):
             return "завтра"
+        if d.date() == today - timedelta(days=1):
+            return "вчера"
         return d.strftime("%d.%m.%Y")
     except Exception:
         return date_str
