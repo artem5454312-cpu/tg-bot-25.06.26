@@ -12,8 +12,6 @@ class Base(DeclarativeBase):
     pass
 
 
-# ─── Enums ──────────────────────────────────────────────────────────────────
-
 class UserRole(str, enum.Enum):
     owner = "owner"
     admin = "admin"
@@ -56,7 +54,7 @@ class NoteType(str, enum.Enum):
 class MemoryType(str, enum.Enum):
     personal = "personal"
     project = "project"
-    global_memory = "global"     # общий чат — без проекта
+    global_memory = "global"
 
 
 class ProjectStatus(str, enum.Enum):
@@ -76,8 +74,6 @@ class ReminderStatus(str, enum.Enum):
     cancelled = "cancelled"
 
 
-# ─── Models ─────────────────────────────────────────────────────────────────
-
 class User(Base):
     __tablename__ = "users"
 
@@ -91,7 +87,10 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
-    tasks: Mapped[List["Task"]] = relationship(back_populates="user")
+    tasks: Mapped[List["Task"]] = relationship(
+        back_populates="user",
+        foreign_keys="Task.user_id"
+    )
     memories: Mapped[List["Memory"]] = relationship(back_populates="user")
     notes: Mapped[List["Note"]] = relationship(back_populates="user")
 
@@ -120,8 +119,8 @@ class Task(Base):
     project_id: Mapped[Optional[int]] = mapped_column(ForeignKey("projects.id"))
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
-    date: Mapped[Optional[str]] = mapped_column(String(10))      # YYYY-MM-DD
-    time: Mapped[Optional[str]] = mapped_column(String(5))       # HH:MM
+    date: Mapped[Optional[str]] = mapped_column(String(10))
+    time: Mapped[Optional[str]] = mapped_column(String(5))
     priority: Mapped[TaskPriority] = mapped_column(SAEnum(TaskPriority), default=TaskPriority.medium)
     status: Mapped[TaskStatus] = mapped_column(SAEnum(TaskStatus), default=TaskStatus.new)
     source: Mapped[TaskSource] = mapped_column(SAEnum(TaskSource), default=TaskSource.text)
@@ -135,7 +134,10 @@ class Task(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    user: Mapped["User"] = relationship(back_populates="tasks", foreign_keys="[Task.user_id]")
+    user: Mapped["User"] = relationship(
+        back_populates="tasks",
+        foreign_keys=[user_id]
+    )
     project: Mapped[Optional["Project"]] = relationship(back_populates="tasks")
     reminders: Mapped[List["Reminder"]] = relationship(back_populates="task")
 
@@ -149,7 +151,7 @@ class Memory(Base):
     type: Mapped[MemoryType] = mapped_column(SAEnum(MemoryType), default=MemoryType.personal)
     title: Mapped[Optional[str]] = mapped_column(String(256))
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    importance: Mapped[int] = mapped_column(Integer, default=5)   # 1–10
+    importance: Mapped[int] = mapped_column(Integer, default=5)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -257,4 +259,3 @@ class ImageGeneration(Base):
     final_prompt: Mapped[Optional[str]] = mapped_column(Text)
     image_url: Mapped[Optional[str]] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
