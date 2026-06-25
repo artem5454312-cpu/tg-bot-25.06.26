@@ -3,6 +3,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config.settings import settings
@@ -19,7 +20,9 @@ async def main():
         token=settings.TELEGRAM_BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
-    dp = Dispatcher()
+    # MemoryStorage нужен для FSM (фото + PIN)
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
     register_all_handlers(dp)
 
     await init_db()
