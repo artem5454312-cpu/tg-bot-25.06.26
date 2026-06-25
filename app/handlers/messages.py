@@ -464,9 +464,9 @@ async def _handle_create_pdf(message: Message, data: dict):
     import asyncio
     project_name = data.get("project") or data.get("title", "Отчёт")
     tg = message.from_user
-    await message.answer(f"📄 Готовлю PDF: <b>{project_name}</b>...
+    await message.answer(f"Готовлю PDF: <b>{project_name}</b>...
 
-Это займёт ~15 секунд, не переключайся 🙏")
+Это займет ~15 секунд.")
 
     async def _generate():
         try:
