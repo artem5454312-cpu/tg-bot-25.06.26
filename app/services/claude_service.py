@@ -297,7 +297,8 @@ async def generate_proactive_message(stale_tasks: list, user_name: str) -> str:
     return clean_markdown(response.content[0].text.strip())
 
 
-async def generate_advice(question: str, memories: str = "") -> str:
+async def generate_advice(question: str, memories: str = "",
+                          dialog_history: list = None) -> str:
     current_date = date.today().strftime("%d.%m.%Y")
     system = f"""Ты мудрый личный ассистент. Сегодня {current_date}.
 
@@ -308,27 +309,40 @@ async def generate_advice(question: str, memories: str = "") -> str:
 - Если знаешь человека по памяти — используй это в ответе
 - Если вопрос о текущих событиях и есть данные из поиска — опирайся на них
 - Если информация может быть устаревшей — честно скажи об этом
+- Помни контекст предыдущих сообщений в диалоге
 
 Формат: только обычный текст, без markdown, без звёздочек, без решёток, без таблиц.
 Используй тире для списков."""
 
-    context = ""
+    system_context = ""
     if memories:
-        context = f"Что ты знаешь о пользователе:\n{memories}\n\n"
+        system_context = f"Что ты знаешь о пользователе:\n{memories}"
 
     # Web search if needed
+    web_context = ""
     if await needs_web_search(question):
         search_results = await search_web(question)
         if search_results:
-            context += f"Актуальные данные из интернета:\n{search_results}\n\n"
+            web_context = f"\n\nАктуальные данные из интернета:\n{search_results}"
 
-    context += f"Вопрос: {question}"
+    # Build messages with dialog history
+    messages = []
+    if dialog_history:
+        for msg in dialog_history[-6:]:  # last 6 messages (3 exchanges)
+            messages.append(msg)
+
+    # Add system context to last user message
+    final_question = question
+    if system_context or web_context:
+        final_question = f"{system_context}{web_context}\n\nВопрос: {question}"
+
+    messages.append({"role": "user", "content": final_question})
 
     response = await client.messages.create(
         model=settings.CLAUDE_MODEL,
         max_tokens=800,
         system=system,
-        messages=[{"role": "user", "content": context}],
+        messages=messages,
     )
     return clean_markdown(response.content[0].text.strip())
 

@@ -1,78 +1,86 @@
 import logging
 import tempfile
 import os
-import requests
+import urllib.request
 
 logger = logging.getLogger(__name__)
 
-FONT_URL = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf"
-FONT_BOLD_URL = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf"
-FONT_PATH = "/tmp/DejaVuSans.ttf"
-FONT_BOLD_PATH = "/tmp/DejaVuSans-Bold.ttf"
+FONT_DIR = "/tmp/fonts"
+FONT_NORMAL = os.path.join(FONT_DIR, "DejaVuSans.ttf")
+FONT_BOLD = os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf")
+
+FONT_URLS = [
+    (FONT_NORMAL, "https://github.com/dejavu-fonts/dejavu-fonts/raw/main/ttf/DejaVuSans.ttf"),
+    (FONT_BOLD, "https://github.com/dejavu-fonts/dejavu-fonts/raw/main/ttf/DejaVuSans-Bold.ttf"),
+]
+
+SYSTEM_FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+]
+SYSTEM_BOLD_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+]
 
 
-def _download_font(url, path):
-    if not os.path.exists(path):
-        try:
-            r = requests.get(url, timeout=10)
-            with open(path, "wb") as f:
-                f.write(r.content)
-        except Exception as e:
-            logger.warning(f"Font download failed: {e}")
-            return False
-    return True
+def _find_system_font(paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _ensure_fonts():
+    os.makedirs(FONT_DIR, exist_ok=True)
+    for path, url in FONT_URLS:
+        if not os.path.exists(path):
+            try:
+                logger.info(f"Downloading font from {url}")
+                urllib.request.urlretrieve(url, path)
+                logger.info(f"Font saved: {path}")
+            except Exception as e:
+                logger.warning(f"Font download failed: {e}")
 
 
 def _register_fonts():
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
 
-    # Try system paths first
-    system_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    ]
-    system_bold_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    ]
+    # Try system fonts first
+    normal = _find_system_font(SYSTEM_FONT_PATHS)
+    bold = _find_system_font(SYSTEM_BOLD_PATHS)
 
-    normal_path = None
-    bold_path = None
+    # Try downloaded fonts
+    if not normal or not bold:
+        _ensure_fonts()
+        if os.path.exists(FONT_NORMAL):
+            normal = FONT_NORMAL
+        if os.path.exists(FONT_BOLD):
+            bold = FONT_BOLD
 
-    for p in system_paths:
-        if os.path.exists(p):
-            normal_path = p
-            break
-    for p in system_bold_paths:
-        if os.path.exists(p):
-            bold_path = p
-            break
-
-    # Download if not found
-    if not normal_path:
-        if _download_font(FONT_URL, FONT_PATH):
-            normal_path = FONT_PATH
-    if not bold_path:
-        if _download_font(FONT_BOLD_URL, FONT_BOLD_PATH):
-            bold_path = FONT_BOLD_PATH
-
-    if normal_path and bold_path:
+    if normal and bold:
         try:
-            pdfmetrics.registerFont(TTFont("DejaVu", normal_path))
-            pdfmetrics.registerFont(TTFont("DejaVuBold", bold_path))
-            return "DejaVu", "DejaVuBold"
+            pdfmetrics.registerFont(TTFont("CyrFont", normal))
+            pdfmetrics.registerFont(TTFont("CyrFontBold", bold))
+            logger.info(f"Fonts registered: {normal}")
+            return "CyrFont", "CyrFontBold"
         except Exception as e:
-            logger.warning(f"Font registration failed: {e}")
+            logger.error(f"Font registration failed: {e}")
 
+    logger.warning("Using Helvetica (no Cyrillic support)")
     return "Helvetica", "Helvetica-Bold"
 
 
 def generate_pdf(title: str, content: str) -> bytes:
     from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import cm
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 
@@ -92,26 +100,16 @@ def generate_pdf(title: str, content: str) -> bytes:
         )
 
         title_style = ParagraphStyle(
-            "Title",
-            fontName=bold_font,
-            fontSize=20,
-            spaceAfter=24,
-            leading=26,
+            "Title", fontName=bold_font, fontSize=20,
+            spaceAfter=24, leading=26,
         )
         heading_style = ParagraphStyle(
-            "Heading",
-            fontName=bold_font,
-            fontSize=14,
-            spaceAfter=10,
-            spaceBefore=16,
-            leading=18,
+            "Heading", fontName=bold_font, fontSize=13,
+            spaceAfter=8, spaceBefore=14, leading=17,
         )
         body_style = ParagraphStyle(
-            "Body",
-            fontName=normal_font,
-            fontSize=11,
-            leading=17,
-            spaceAfter=6,
+            "Body", fontName=normal_font, fontSize=11,
+            leading=17, spaceAfter=5,
         )
 
         story = [Paragraph(title, title_style), Spacer(1, 8)]
@@ -119,14 +117,12 @@ def generate_pdf(title: str, content: str) -> bytes:
         for line in content.split("\n"):
             line = line.strip()
             if not line:
-                story.append(Spacer(1, 8))
+                story.append(Spacer(1, 6))
                 continue
-            # Detect headings (lines ending with : or all caps short lines)
             if line.endswith(":") and len(line) < 60:
                 story.append(Paragraph(line, heading_style))
             else:
-                # Clean markdown artifacts
-                line = line.lstrip("•-–— ")
+                line = line.lstrip("•-–— #*")
                 story.append(Paragraph(line, body_style))
 
         doc.build(story)
