@@ -15,7 +15,7 @@ async def generate_image(prompt: str) -> bytes:
         prompt=prompt,
         n=1,
         size="1024x1792",   # 9:16 vertical — ideal for reels/stories
-        quality="hd",
+        quality="high",
     )
     image_data = response.data[0]
 
