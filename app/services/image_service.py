@@ -1,5 +1,5 @@
 import logging
-import httpx
+import base64
 from openai import AsyncOpenAI
 from config.settings import settings
 
@@ -14,11 +14,19 @@ async def generate_image(prompt: str) -> bytes:
         prompt=prompt,
         n=1,
         size="1024x1024",
-        response_format="url"
     )
-    image_url = response.data[0].url
+    # gpt-image-1 returns base64 by default
+    image_data = response.data[0]
     
-    async with httpx.AsyncClient() as client:
-        img_response = await client.get(image_url)
-        img_response.raise_for_status()
-        return img_response.content
+    if hasattr(image_data, 'b64_json') and image_data.b64_json:
+        return base64.b64decode(image_data.b64_json)
+    
+    # dall-e-3 returns URL
+    if hasattr(image_data, 'url') and image_data.url:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            img_response = await client.get(image_data.url)
+            img_response.raise_for_status()
+            return img_response.content
+    
+    raise ValueError("No image data in response")
