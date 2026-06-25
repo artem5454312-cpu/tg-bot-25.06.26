@@ -56,10 +56,29 @@ async def tasks_callback(call: CallbackQuery):
         await call.answer()
         return
 
+    from datetime import datetime, date, timedelta
+
+    def fmt_date(date_str):
+        if not date_str:
+            return ""
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d").date()
+            today = date.today()
+            if d == today:
+                return "сегодня"
+            if d == today + timedelta(days=1):
+                return "завтра"
+            if d == today - timedelta(days=1):
+                return "вчера"
+            return d.strftime("%d.%m.%Y")
+        except Exception:
+            return date_str
+
     lines = [f"<b>{label}</b>\n"]
     for t in tasks:
         time_str = f" {t.time}" if t.time else ""
-        date_str = f" [{t.date}{time_str}]" if t.date else ""
+        date_label = fmt_date(t.date)
+        date_str = f" [{date_label}{time_str}]" if date_label else (f" [{time_str.strip()}]" if time_str.strip() else "")
         status_icon = "✅" if t.status.value == "done" else "🔲"
         lines.append(f"{status_icon} {t.title}{date_str}")
 
